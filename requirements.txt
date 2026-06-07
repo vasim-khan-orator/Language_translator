@@ -1,0 +1,16 @@
+PyQt6==6.7.1
+torch
+torchaudio
+transformers
+sentencepiece
+sacremoses
+accelerate
+protobuf
+numpy
+scipy
+soundfile
+pyaudio
+faster-whisper
+silero-vad
+indic-nlp-library
+ctranslate2
