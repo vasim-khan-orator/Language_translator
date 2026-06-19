@@ -2,39 +2,158 @@ import time
 
 
 class SilenceManager:
+    """
+    Decides when a spoken utterance is "done" and
+    the token buffer should be finalized.
 
-    def __init__(self, silence_threshold=1.0):
+    Three independent conditions can trigger finalization,
+    all checked through the single should_finalize() call:
 
+      1. SILENCE — speaker paused for >= silence_threshold
+         seconds. Raised from V1's 1.0 s to 2.0 s so that
+         natural breath-pauses between clauses don't flush
+         the buffer mid-sentence.
+
+      2. HARD TIMEOUT — speaker has been talking for >=
+         hard_timeout seconds without a long enough pause.
+         Prevents the semantic token buffer from growing
+         unbounded during very long continuous speech.
+         Matches the 30–60 s semantic memory window in the
+         V2 architecture doc.
+
+      3. MIN TOKENS GATE — finalization is suppressed when
+         the buffer holds fewer than min_tokens tokens,
+         regardless of how long the silence has been.
+         This was the direct cause of single-word "final
+         translations" in V1 (silence_threshold=1.0 flushed
+         the buffer after every word).
+
+    Filler detection is intentionally kept outside this
+    class — a filler word should always trigger finalization
+    regardless of token count, so main.py handles that
+    branch separately and calls reset() directly.
+    """
+
+    def __init__(
+        self,
+        silence_threshold=2.0,
+        min_tokens=3,
+        hard_timeout=45.0,
+    ):
+        # Seconds of continuous silence before finalizing.
+        # 2.0 s is long enough to survive natural clause
+        # pauses but short enough to feel responsive.
         self.silence_threshold = silence_threshold
 
-        self.last_activity_time = time.time()
+        # Minimum number of tokens that must be buffered
+        # before a silence event can trigger finalization.
+        # Prevents 1–2 word fragments being output as
+        # complete sentences.
+        self.min_tokens = min_tokens
+
+        # Maximum seconds a single utterance can run
+        # before being force-finalized.
+        self.hard_timeout = hard_timeout
+
+        now = time.time()
+
+        # Updated every time new speech activity is seen.
+        self.last_activity_time = now
+
+        # Set once at the start of each new utterance
+        # (reset on finalization). Used for hard_timeout.
+        self.utterance_start_time = now
 
 
     # -----------------------------
     # UPDATE ACTIVITY
     # -----------------------------
     def update_activity(self):
-
+        """
+        Call whenever a new word/token is received.
+        Pushes back the silence clock.
+        """
         self.last_activity_time = time.time()
 
 
     # -----------------------------
-    # CHECK SILENCE
+    # SILENCE CHECK
     # -----------------------------
     def is_silence_detected(self):
-
-        current_time = time.time()
-
+        """
+        Returns True if the speaker has been quiet
+        for at least silence_threshold seconds.
+        """
         silence_duration = (
-            current_time - self.last_activity_time
+            time.time() - self.last_activity_time
         )
-
         return silence_duration >= self.silence_threshold
 
 
     # -----------------------------
-    # RESET TIMER
+    # HARD TIMEOUT CHECK
+    # -----------------------------
+    def is_hard_timeout(self):
+        """
+        Returns True if the current utterance has been
+        running for longer than hard_timeout seconds.
+        Prevents unbounded token buffer growth during
+        very long continuous speech.
+        """
+        utterance_duration = (
+            time.time() - self.utterance_start_time
+        )
+        return utterance_duration >= self.hard_timeout
+
+
+    # -----------------------------
+    # SILENCE DURATION
+    # -----------------------------
+    def get_silence_duration(self):
+        """
+        Returns current silence duration in seconds.
+        Useful for the output renderer to fade or
+        animate the display as silence builds.
+        """
+        return time.time() - self.last_activity_time
+
+
+    # =====================================================
+    # SHOULD FINALIZE  ← primary API for main.py
+    # =====================================================
+    def should_finalize(self, token_count):
+        """
+        Single decision point for main.py.
+
+        Returns True when ALL of the following hold:
+          - token_count >= min_tokens  (enough content)
+          - silence is detected  OR  hard timeout hit
+
+        Usage in main.py:
+            if filler_detected or silence_manager.should_finalize(
+                len(token_buffer.get_tokens())
+            ):
+                # finalize and reset
+
+        Note: filler_detected is kept outside this method
+        intentionally — fillers bypass the min_tokens gate
+        since they are explicit sentence-boundary markers.
+        """
+        if token_count < self.min_tokens:
+            return False
+
+        return self.is_silence_detected() or self.is_hard_timeout()
+
+
+    # -----------------------------
+    # RESET
     # -----------------------------
     def reset(self):
-
-        self.last_activity_time = time.time()
+        """
+        Call after finalization.
+        Resets BOTH timers so the next utterance
+        starts with a clean slate.
+        """
+        now = time.time()
+        self.last_activity_time = now
+        self.utterance_start_time = now

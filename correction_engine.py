@@ -1,71 +1,67 @@
-# -----------------------------
+from translator_engine import translate_phrase
+
+
+# =====================================================
 # RECONSTRUCT SENTENCE
-# -----------------------------
+# =====================================================
+#
+# V1 approach (removed):
+#   - Join per-word English translations (already wrong)
+#   - Run 3 hardcoded keyword rules to patch SOV order
+#   Result: only worked for one demo sentence; produced
+#   "Alive kill dunga" / "In tax four khar go i am" for
+#   everything else.
+#
+# V2 approach (this file):
+#   - Join all HINDI tokens from the buffer into one
+#     full sentence string
+#   - Pass that one sentence to translate_phrase()
+#   - IndicTrans2 now has full grammatical context:
+#       • SOV → SVO reordering done by the model
+#       • Verb conjugations decoded correctly
+#       • Articles (to / the / a) inserted automatically
+#   - apply_rules() is gone — no manual patches needed
+# =====================================================
+
 def reconstruct_sentence(tokens):
+    """
+    Translate the full buffered Hindi sentence at once.
 
-    english_words = []
+    Args:
+        tokens : list of dicts with keys "hindi" and "english"
+                 (the "english" key is ignored here — translation
+                  is now done on the joined Hindi string, not
+                  on the per-word English values)
 
-    for token in tokens:
+    Returns:
+        Grammatically correct English sentence string,
+        or empty string if tokens is empty.
+    """
 
-        english_words.append(
-            token["english"]
-        )
+    if not tokens:
+        return ""
 
-    raw_sentence = " ".join(english_words)
-
-    corrected_sentence = apply_rules(
-        raw_sentence
+    # Join all buffered Hindi words into one sentence string.
+    # IndicTrans2 needs the complete sentence to produce
+    # correct word order — feeding it word-by-word is what
+    # caused the SOV salad in V1.
+    hindi_sentence = " ".join(
+        token["hindi"] for token in tokens
     )
 
-    return corrected_sentence
+    # Single phrase-level translation call.
+    # translate_phrase() handles the hin_Deva eng_Latn
+    # prefix and max_new_tokens — see translator_engine.py.
+    translated = translate_phrase(hindi_sentence)
 
+    if not translated:
+        # Fallback: raw English join (same as V1 output)
+        # so the display never goes blank on a model error.
+        fallback = " ".join(
+            token["english"] for token in tokens
+        )
+        return fallback.capitalize()
 
-# -----------------------------
-# RULE ENGINE
-# -----------------------------
-def apply_rules(sentence):
-
-    words = sentence.lower().split()
-
-    # -----------------------------
-    # SIMPLE TIME CORRECTION
-    # -----------------------------
-    if "tomorrow" in words and "went" in words:
-
-        words.remove("tomorrow")
-
-        words.insert(0, "yesterday")
-
-    # -----------------------------
-    # MARKET FIX
-    # -----------------------------
-    if "market" in words:
-
-        index = words.index("market")
-
-        words.insert(index, "the")
-
-        if "to" not in words:
-            words.insert(index, "to")
-
-    # -----------------------------
-    # VERB REORDERING
-    # -----------------------------
-    if "went" in words:
-
-        words.remove("went")
-
-        if "i" in words:
-
-            i_index = words.index("i")
-
-            words.insert(i_index + 1, "went")
-
-    # -----------------------------
-    # CAPITALIZATION
-    # -----------------------------
-    final_sentence = " ".join(words)
-
-    final_sentence = final_sentence.capitalize()
-
-    return final_sentence
+    # Capitalize first letter as a safety step in case
+    # the model returns a lowercase-first string.
+    return translated[0].upper() + translated[1:]

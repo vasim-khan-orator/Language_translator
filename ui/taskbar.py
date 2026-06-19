@@ -5,8 +5,6 @@ from PyQt6.QtWidgets import QFrame, QHBoxLayout, QToolButton
 
 
 class Taskbar(QFrame):
-    home_clicked = pyqtSignal()
-    browser_clicked = pyqtSignal()
     settings_clicked = pyqtSignal()
     exit_clicked = pyqtSignal()
 
@@ -37,18 +35,12 @@ class Taskbar(QFrame):
         layout.setContentsMargins(18, 8, 18, 8)
         layout.setSpacing(12)
 
-        self._home_button = self._build_button("Home")
-        self._browser_button = self._build_button("Browser")
         self._settings_button = self._build_button("Settings")
         self._exit_button = self._build_button("Exit")
 
-        self._home_button.clicked.connect(self.home_clicked.emit)
-        self._browser_button.clicked.connect(self.browser_clicked.emit)
         self._settings_button.clicked.connect(self.settings_clicked.emit)
         self._exit_button.clicked.connect(self.exit_clicked.emit)
 
-        layout.addWidget(self._home_button)
-        layout.addWidget(self._browser_button)
         layout.addWidget(self._settings_button)
         layout.addWidget(self._exit_button)
 
