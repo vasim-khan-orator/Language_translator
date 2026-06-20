@@ -116,13 +116,17 @@ def diff_new_words(prev_words, new_words):
     one word than to drop real new content).
     """
     if not prev_words:
-        return new_words
+        # No previous hypothesis — nothing to remove, all words are new
+        return 0, new_words
 
     if not new_words:
-        return []
+        # No new hypothesis — remove entire previous suffix
+        return len(prev_words), []
 
-    # Find the longest suffix of prev_words that
-    # matches a prefix of new_words (the overlap).
+    # Find the longest suffix of prev_words that matches
+    # a prefix of new_words (the overlap). We'll remove the
+    # non-overlapping tail of prev_words and replace it with
+    # the non-overlapping tail of new_words.
     max_check = min(len(prev_words), len(new_words))
 
     overlap_len = 0
@@ -132,4 +136,7 @@ def diff_new_words(prev_words, new_words):
             overlap_len = i
             break
 
-    return new_words[overlap_len:]
+    remove_count = len(prev_words) - overlap_len
+    replacement_words = new_words[overlap_len:]
+
+    return remove_count, replacement_words

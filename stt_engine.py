@@ -149,4 +149,11 @@ def transcribe_audio(audio_chunk):
     if not _is_valid_hindi(final_text):
         return None
 
-    return final_text if final_text else None
+    if final_text:
+        return {
+            "text": final_text,
+            "confidence": float(info.language_probability),
+            "is_final": False,
+        }
+
+    return None

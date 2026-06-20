@@ -52,8 +52,11 @@ class SubtitleRenderer:
 
     def __init__(self):
         self._history      = []   # list of (hindi_str, translated_str)
-        self._live_hindi   = ""
-        self._live_english = ""
+        # Token-level live state so we can render stable vs interim
+        # tokens separately (stable white, interim gray).
+        self._live_hindi_tokens = []
+        self._live_english_tokens = []
+        self._live_stable_count = None
         self._initialized  = False
 
         # Check once — if stdout is not a real TTY
@@ -142,11 +145,18 @@ class SubtitleRenderer:
         lines.append(light)
 
         # ---- Line 4 : live Hindi ----
-        if self._live_hindi:
+        if self._live_hindi_tokens:
+            stable = self._live_stable_count if self._live_stable_count is not None else len(self._live_hindi_tokens)
+
+            parts = []
+            for i, tok in enumerate(self._live_hindi_tokens):
+                color = _WHITE if i < stable else _GRAY
+                parts.append(f"{color}{tok}{_RESET}")
+
+            hindi_line = " ".join(parts)
+
             lines.append(
-                f"  {_BOLD}{_CYAN}▶  "
-                f"{self._fit(self._live_hindi, inner - 4)}"
-                f"{_RESET}"
+                f"  {_BOLD}▶  {self._fit(hindi_line, inner - 4)}{_RESET}"
             )
         else:
             lines.append(
@@ -154,12 +164,17 @@ class SubtitleRenderer:
             )
 
         # ---- Line 5 : live English ----
-        if self._live_english:
-            lines.append(
-                f"     {_YELLOW}"
-                f"{self._fit(self._live_english, inner - 5)}"
-                f"{_RESET}"
-            )
+        if self._live_english_tokens:
+            stable = self._live_stable_count if self._live_stable_count is not None else len(self._live_english_tokens)
+
+            parts = []
+            for i, tok in enumerate(self._live_english_tokens):
+                color = _WHITE if i < stable else _GRAY
+                parts.append(f"{color}{tok}{_RESET}")
+
+            english_line = " ".join(parts)
+
+            lines.append(f"     {self._fit(english_line, inner - 5)}")
         else:
             # Keep the line present (but empty) so the
             # total count is always _DISPLAY_LINES.
@@ -194,9 +209,15 @@ class SubtitleRenderer:
         (e.g. output piped to a file or another process).
         Mirrors the information shown in the ANSI display.
         """
-        if self._live_hindi:
-            print(f"[LIVE] {self._live_hindi}")
-            print(f"       {self._live_english}")
+        if self._live_hindi_tokens:
+            stable = self._live_stable_count if self._live_stable_count is not None else len(self._live_hindi_tokens)
+            stable_part = " ".join(self._live_hindi_tokens[:stable])
+            interim_part = " ".join(self._live_hindi_tokens[stable:])
+
+            if stable_part:
+                print(f"[LIVE] {stable_part}")
+            if interim_part:
+                print(f"       {interim_part} (interim)")
 
         elif self._history:
             h, t = self._history[-1]
@@ -207,7 +228,7 @@ class SubtitleRenderer:
     # PUBLIC API
     # =====================================================
 
-    def update_live(self, hindi_words, english_words):
+    def update_live(self, hindi_words, english_words, stable_count=None):
         """
         Call on every new token, passing the FULL
         accumulated word lists (not just the new word).
@@ -220,8 +241,9 @@ class SubtitleRenderer:
             english_words : corresponding English
                             translations (same length)
         """
-        self._live_hindi   = " ".join(hindi_words)
-        self._live_english = " ".join(english_words)
+        self._live_hindi_tokens = list(hindi_words)
+        self._live_english_tokens = list(english_words)
+        self._live_stable_count = stable_count
         self._render()
 
 
@@ -248,8 +270,9 @@ class SubtitleRenderer:
             if len(self._history) > self._MAX_HISTORY:
                 self._history.pop(0)
 
-        self._live_hindi   = ""
-        self._live_english = ""
+        self._live_hindi_tokens = []
+        self._live_english_tokens = []
+        self._live_stable_count = None
         self._render()
 
 
@@ -259,8 +282,9 @@ class SubtitleRenderer:
         Call on startup or when restarting a session.
         """
         self._history      = []
-        self._live_hindi   = ""
-        self._live_english = ""
+        self._live_hindi_tokens = []
+        self._live_english_tokens = []
+        self._live_stable_count = None
         self._initialized  = False
 
 
@@ -275,13 +299,13 @@ class SubtitleRenderer:
 _renderer = SubtitleRenderer()
 
 
-def update_live(hindi_words, english_words):
+def update_live(hindi_words, english_words, stable_count=None):
     """
     Update the live accumulating subtitle area.
     Pass the full accumulated word lists, not just
     the latest word.
     """
-    _renderer.update_live(hindi_words, english_words)
+    _renderer.update_live(hindi_words, english_words, stable_count=stable_count)
 
 
 def finalize(hindi, english, translated):
@@ -307,6 +331,6 @@ def clear():
 # --------------------------------------------------
 def display_output(mode, hindi, english):
     if mode == "LIVE":
-        _renderer.update_live([hindi], [english])
+        _renderer.update_live([hindi], [english], stable_count=None)
     elif mode == "FINAL":
         _renderer.finalize(hindi, english, english)

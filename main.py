@@ -152,10 +152,12 @@ def speech_recognition_worker():
 
             hindi_text = transcribe_audio(window)
 
-            # transcribe_audio() now returns None (not "") on
-            # rejected audio — the `if hindi_text` guard handles both
+            # transcribe_audio() returns a dict with keys
+            # {"text", "confidence", "is_final"} on success.
+            # Push only the text string into the processing queue
+            # so downstream code that expects a string works.
             if hindi_text:
-                text_queue.put(hindi_text)
+                text_queue.put(hindi_text["text"])
                 silence_manager.update_activity()
 
             rolling_buffer = window[-OVERLAP_SAMPLES:]
@@ -222,10 +224,17 @@ def word_processing_worker():
                 # single-word memory with a proper hypothesis diff.
                 # -----------------------------------------------
 
-                new_words = diff_new_words(prev_words, all_words)
+                remove_count, replacement_words = diff_new_words(
+                    prev_words, all_words
+                )
                 prev_words = all_words
 
-                for word in new_words:
+                # Build replacement token dicts and atomically replace
+                # the previous non-overlapping suffix in the token buffer.
+                start_index = len(token_buffer) - remove_count if remove_count else len(token_buffer)
+
+                replacement_tokens = []
+                for word in replacement_words:
 
                     # ---------------------------------
                     # FILLER DETECTION
@@ -241,26 +250,27 @@ def word_processing_worker():
 
                     english_word = translate_word(word)
 
-                    # ---------------------------------
-                    # STORE SEMANTIC TOKEN
-                    # ---------------------------------
+                    replacement_tokens.append({
+                        "hindi": word,
+                        "english": english_word,
+                    })
 
-                    token_buffer.add_token(
-                        hindi_word=word,
-                        english_word=english_word
+                if replacement_tokens or remove_count:
+                    # Apply replacement in the token buffer
+                    token_buffer.replace_tokens(start_index, replacement_tokens)
+
+                    # Update live lists to reflect the buffer state
+                    live_hindi_words = (
+                        live_hindi_words[:start_index]
+                        + [t["hindi"] for t in replacement_tokens]
+                    )
+                    live_english_words = (
+                        live_english_words[:start_index]
+                        + [t["english"] for t in replacement_tokens]
                     )
 
-                    live_hindi_words.append(word)
-                    live_english_words.append(english_word)
-
-                    # ---------------------------------
-                    # LIVE SUBTITLE UPDATE
-                    # Pass FULL accumulated lists so the
-                    # renderer always has the complete
-                    # in-progress sentence, not one word
-                    # ---------------------------------
-
-                    update_live(live_hindi_words, live_english_words)
+                    # Reflect the change immediately (provide stable_count)
+                    update_live(live_hindi_words, live_english_words, stable_count=start_index)
 
             except Exception as e:
                 print(f"[Processing] Word error: {e}", file=sys.stderr)
