@@ -1,145 +1,82 @@
 """
-hypothesis_manager.py
+Manage Whisper hypothesis updates to prefer in-place
+replacements for partial word edits while still handling
+rolling-window suffix overlaps.
 
-Maintains a stable streaming transcript from Whisper.
+API:
+    hm = HypothesisManager()
+    remove_count, replacement_words = hm.update_and_diff(new_words)
 
-Instead of permanently accepting every new Whisper output,
-this module compares the previous hypothesis with the new one
-and commits only the genuinely stable words.
-
-Example
-
-Previous:
-    मैं घर
-
-Current:
-    मैं घर जा
-
-Stable:
-    मैं घर
-
-Pending:
-    जा
-
--------------------------
-
-Previous:
-    मैं घर जा
-
-Current:
-    मैं घर जाता हूँ
-
-Stable:
-    मैं घर
-
-Pending:
-    जाता हूँ
-
-Only stable words should enter the TokenBuffer.
+This returns the number of words to remove from the existing
+token buffer and the list of replacement words to append.
 """
-
-from typing import List
+from typing import List, Tuple
 
 
 class HypothesisManager:
-
     def __init__(self):
+        self.prev_words: List[str] = []
 
-        # Previous Whisper hypothesis
-        self.previous_words: List[str] = []
+    def _suffix_prefix_overlap(self, prev: List[str], new: List[str]) -> int:
+        max_check = min(len(prev), len(new))
+        overlap_len = 0
+        for i in range(max_check, 0, -1):
+            if prev[-i:] == new[:i]:
+                overlap_len = i
+                break
+        return overlap_len
 
-        # Words already committed to TokenBuffer
-        self.committed_words: List[str] = []
-
-
-    # --------------------------------------------------
-    # Longest Common Prefix
-    # --------------------------------------------------
-
-    def _common_prefix_length(
-        self,
-        a: List[str],
-        b: List[str]
-    ) -> int:
-
+    def _common_prefix_len(self, prev: List[str], new: List[str]) -> int:
+        max_check = min(len(prev), len(new))
         i = 0
-
-        while (
-            i < len(a)
-            and i < len(b)
-            and a[i] == b[i]
-        ):
+        while i < max_check and prev[i] == new[i]:
             i += 1
-
         return i
 
-
-    # --------------------------------------------------
-    # Update Hypothesis
-    # --------------------------------------------------
-
-    def update(self, current_words: List[str]):
-
+    def update_and_diff(self, new_words: List[str]) -> Tuple[int, List[str]]:
         """
-        Parameters
-        ----------
-        current_words
-            Latest Whisper hypothesis.
+        Compute an incremental diff between the previously-seen
+        hypothesis and the incoming `new_words` list.
 
-        Returns
-        -------
-        newly_stable_words
-            Words that became stable since the previous update.
+        Strategy: compute both the trailing-suffix -> leading-prefix
+        overlap (best for rolling windows) and the common-prefix
+        match (best for partial-word replacements). Choose the
+        strategy that minimizes the number of words to remove from
+        the previous hypothesis.
         """
+        prev = self.prev_words
 
-        prefix = self._common_prefix_length(
-            self.previous_words,
-            current_words
-        )
+        if not prev:
+            remove_count = 0
+            replacement = new_words
+            self.prev_words = new_words
+            return remove_count, replacement
 
-        newly_stable = []
+        if not new_words:
+            remove_count = len(prev)
+            replacement = []
+            self.prev_words = []
+            return remove_count, replacement
 
-        # Commit only words that are stable
-        while len(self.committed_words) < prefix:
+        suffix_overlap = self._suffix_prefix_overlap(prev, new_words)
+        prefix_common = self._common_prefix_len(prev, new_words)
 
-            newly_stable.append(
-                current_words[len(self.committed_words)]
-            )
+        # Compute remove counts for both strategies
+        remove_suffix = len(prev) - suffix_overlap
+        remove_prefix = len(prev) - prefix_common
 
-            self.committed_words.append(
-                current_words[len(self.committed_words)]
-            )
+        if remove_suffix <= remove_prefix:
+            # Prefer suffix->prefix overlap when it reduces removals
+            remove_count = remove_suffix
+            replacement = new_words[suffix_overlap:]
+        else:
+            remove_count = remove_prefix
+            replacement = new_words[prefix_common:]
 
-        self.previous_words = current_words.copy()
+        # Update stored hypothesis
+        self.prev_words = new_words
 
-        return newly_stable
-
-
-    # --------------------------------------------------
-    # Pending Words
-    # --------------------------------------------------
-
-    def get_pending_words(self):
-
-        return self.previous_words[
-            len(self.committed_words):
-        ]
-
-
-    # --------------------------------------------------
-    # Current Transcript
-    # --------------------------------------------------
-
-    def get_transcript(self):
-
-        return self.previous_words.copy()
+        return remove_count, replacement
 
 
-    # --------------------------------------------------
-    # Reset
-    # --------------------------------------------------
-
-    def reset(self):
-
-        self.previous_words.clear()
-        self.committed_words.clear()
+__all__ = ["HypothesisManager"]

@@ -91,6 +91,56 @@ class SilenceManager:
 
 
     # -----------------------------
+    # GRAMMAR COMPLETION HEURISTICS
+    # -----------------------------
+    def is_grammar_complete(self, tokens):
+        """
+        Heuristic checks to determine if the most recent token(s)
+        form a grammatically complete sentence. Accepts `tokens`
+        as a list of token dicts (with keys 'hindi' and/or 'english')
+        or as a list of strings.
+        """
+        if not tokens:
+            return False
+
+        # Accept either token dicts or raw strings
+        if isinstance(tokens[0], dict):
+            last_hindi = tokens[-1].get("hindi", "")
+            last_english = tokens[-1].get("english", "")
+        else:
+            # assume list of strings (Hindi)
+            last_hindi = tokens[-1]
+            last_english = ""
+
+        last_hindi = (last_hindi or "").strip()
+        last_english = (last_english or "").strip()
+
+        # Punctuation that strongly indicates sentence end
+        terminal_chars = ["।", ".", "?", "!", ";"]
+        for ch in terminal_chars:
+            if last_hindi.endswith(ch) or last_english.endswith(ch):
+                return True
+
+        # Common Hindi verb/sentence endings (heuristic suffixes)
+        suffixes = [
+            "हूँ", "है", "हैं", "था", "थे", "थी",
+            "रहा", "रही", "रहे", "गया", "गई", "गए",
+            "जाता", "जाती", "जाते", "करता", "करती", "करते",
+            "होगा", "होगी", "होंगे", "दी", "दिया", "दे", "दीया"
+        ]
+
+        for s in suffixes:
+            if last_hindi.endswith(s):
+                return True
+
+        # Fallback: if last English token looks like a finished clause
+        if last_english and last_english[-1] in ".!?":
+            return True
+
+        return False
+
+
+    # -----------------------------
     # HARD TIMEOUT CHECK
     # -----------------------------
     def is_hard_timeout(self):
@@ -139,10 +189,22 @@ class SilenceManager:
         intentionally — fillers bypass the min_tokens gate
         since they are explicit sentence-boundary markers.
         """
+        # Backwards-compatible: if a list was passed instead of a count,
+        # extract the length and keep the tokens for grammar checks.
+        tokens = None
+        if isinstance(token_count, (list, tuple)):
+            tokens = token_count
+            token_count = len(tokens)
+
         if token_count < self.min_tokens:
             return False
 
-        return self.is_silence_detected() or self.is_hard_timeout()
+        # Primary trigger: grammatical sentence completion.
+        if tokens is not None and self.is_grammar_complete(tokens):
+            return True
+
+        # Secondary trigger: hard timeout as before.
+        return self.is_hard_timeout()
 
 
     # -----------------------------

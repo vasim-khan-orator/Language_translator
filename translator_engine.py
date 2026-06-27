@@ -1,5 +1,10 @@
 from transformers import AutoTokenizer
 from transformers import AutoModelForSeq2SeqLM
+import queue
+import threading
+import collections
+from typing import Optional, Callable
+import time
 
 
 # =====================================================
@@ -43,15 +48,136 @@ _PREFIX = "hin_Deva eng_Latn"
 # CACHES
 # =====================================================
 
-# Separate caches for the two translation modes so
-# a word cached from live display is never mistakenly
-# reused as a full-sentence translation (or vice-versa).
-
 # word-level cache: { "word": "translation" }
 _word_cache = {}
 
-# phrase-level cache: { "full hindi sentence": "translation" }
-_phrase_cache = {}
+
+# Simple thread-safe LRU cache for phrase translations.
+class LRUCache:
+    def __init__(self, maxsize=200):
+        self.maxsize = maxsize
+        self.lock = threading.Lock()
+        self.data = collections.OrderedDict()
+
+    def get(self, key):
+        with self.lock:
+            try:
+                val = self.data.pop(key)
+                # move to end (most-recent)
+                self.data[key] = val
+                return val
+            except KeyError:
+                return None
+
+    def set(self, key, value):
+        with self.lock:
+            if key in self.data:
+                self.data.pop(key)
+            self.data[key] = value
+            if len(self.data) > self.maxsize:
+                # pop least-recently-used
+                self.data.popitem(last=False)
+
+    def contains(self, key):
+        with self.lock:
+            return key in self.data
+
+
+# phrase-level cache using LRU
+_phrase_cache = LRUCache(maxsize=512)
+
+
+# =====================================================
+# ASYNC PHRASE QUEUE
+# =====================================================
+
+# Items are tuples: (hindi_sentence, optional callback)
+_phrase_queue = queue.Queue()
+
+
+def enqueue_phrase(hindi_sentence: str, callback: Optional[Callable[[Optional[str]], None]] = None):
+    """Enqueue a phrase for asynchronous translation. Callback is called
+    with the translation (or None on failure) once available."""
+    if not hindi_sentence or not hindi_sentence.strip():
+        if callback:
+            callback(None)
+        return
+
+    key = hindi_sentence.strip()
+
+    # If already cached, call back immediately
+    cached = _phrase_cache.get(key)
+    if cached is not None:
+        if callback:
+            callback(cached)
+        return
+
+    _phrase_queue.put((key, callback))
+
+
+def _phrase_worker():
+    while True:
+        try:
+            key, callback = _phrase_queue.get()
+        except Exception:
+            time.sleep(0.1)
+            continue
+
+        if not key:
+            if callback:
+                callback(None)
+            _phrase_queue.task_done()
+            continue
+
+        # Double-check cache to avoid duplicated work
+        cached = _phrase_cache.get(key)
+        if cached is not None:
+            if callback:
+                callback(cached)
+            _phrase_queue.task_done()
+            continue
+
+        formatted = f"{_PREFIX} {key}"
+
+        try:
+            inputs = tokenizer(
+                formatted,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=256,
+            )
+
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=_MAX_NEW_TOKENS,
+                num_beams=4,
+                early_stopping=True,
+            )
+
+            translated = tokenizer.batch_decode(
+                outputs,
+                skip_special_tokens=True
+            )[0].strip()
+
+            if translated:
+                _phrase_cache.set(key, translated)
+                if callback:
+                    callback(translated)
+            else:
+                if callback:
+                    callback(None)
+
+        except Exception:
+            if callback:
+                callback(None)
+
+        _phrase_queue.task_done()
+
+
+# Start background worker thread
+_worker_thread = threading.Thread(target=_phrase_worker, daemon=True)
+_worker_thread.start()
 
 
 # =====================================================
@@ -87,8 +213,9 @@ def translate_phrase(hindi_sentence):
 
     key = hindi_sentence.strip()
 
-    if key in _phrase_cache:
-        return _phrase_cache[key]
+    cached = _phrase_cache.get(key)
+    if cached is not None:
+        return cached
 
     formatted = f"{_PREFIX} {key}"
 
@@ -114,7 +241,7 @@ def translate_phrase(hindi_sentence):
         )[0].strip()
 
         if translated:
-            _phrase_cache[key] = translated
+            _phrase_cache.set(key, translated)
             return translated
 
         return None

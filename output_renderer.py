@@ -107,7 +107,51 @@ class SubtitleRenderer:
         # ---- Line 0 : top border ----
         lines.append(heavy)
 
-        # ---- Lines 1-2 : history slots ----
+        # ---- Line 1-2 : live area (Hindi then English) ----
+        # Live content is now shown above the divider so the
+        # interface feels more "Google-like": immediate live
+        # captions at the top, finalized history below.
+
+        # ---- Line 1 : live Hindi ----
+        if self._live_hindi_tokens:
+            stable = self._live_stable_count if self._live_stable_count is not None else len(self._live_hindi_tokens)
+
+            parts = []
+            for i, tok in enumerate(self._live_hindi_tokens):
+                color = _WHITE if i < stable else _GRAY
+                parts.append(f"{color}{tok}{_RESET}")
+
+            hindi_line = " ".join(parts)
+
+            lines.append(
+                f"  {_BOLD}▶  {self._fit(hindi_line, inner - 4)}{_RESET}"
+            )
+        else:
+            lines.append(
+                f"  {_DIM}{_GRAY}Listening...{_RESET}"
+            )
+
+        # ---- Line 2 : live English ----
+        if self._live_english_tokens:
+            stable = self._live_stable_count if self._live_stable_count is not None else len(self._live_english_tokens)
+
+            parts = []
+            for i, tok in enumerate(self._live_english_tokens):
+                color = _WHITE if i < stable else _GRAY
+                parts.append(f"{color}{tok}{_RESET}")
+
+            english_line = " ".join(parts)
+
+            lines.append(f"     {self._fit(english_line, inner - 5)}")
+        else:
+            # Keep the line present (but empty) so the
+            # total count is always _DISPLAY_LINES.
+            lines.append("")
+
+        # ---- Line 3 : light divider ----
+        lines.append(light)
+
+        # ---- Lines 4-5 : history slots ----
         # Always emit exactly _MAX_HISTORY lines so the
         # fixed line count stays constant regardless of
         # how many sentences have been finalized so far.
@@ -141,45 +185,6 @@ class SubtitleRenderer:
 
             lines.append(line)
 
-        # ---- Line 3 : light divider ----
-        lines.append(light)
-
-        # ---- Line 4 : live Hindi ----
-        if self._live_hindi_tokens:
-            stable = self._live_stable_count if self._live_stable_count is not None else len(self._live_hindi_tokens)
-
-            parts = []
-            for i, tok in enumerate(self._live_hindi_tokens):
-                color = _WHITE if i < stable else _GRAY
-                parts.append(f"{color}{tok}{_RESET}")
-
-            hindi_line = " ".join(parts)
-
-            lines.append(
-                f"  {_BOLD}▶  {self._fit(hindi_line, inner - 4)}{_RESET}"
-            )
-        else:
-            lines.append(
-                f"  {_DIM}{_GRAY}Listening...{_RESET}"
-            )
-
-        # ---- Line 5 : live English ----
-        if self._live_english_tokens:
-            stable = self._live_stable_count if self._live_stable_count is not None else len(self._live_english_tokens)
-
-            parts = []
-            for i, tok in enumerate(self._live_english_tokens):
-                color = _WHITE if i < stable else _GRAY
-                parts.append(f"{color}{tok}{_RESET}")
-
-            english_line = " ".join(parts)
-
-            lines.append(f"     {self._fit(english_line, inner - 5)}")
-        else:
-            # Keep the line present (but empty) so the
-            # total count is always _DISPLAY_LINES.
-            lines.append("")
-
         # ---- Line 6 : bottom border ----
         lines.append(heavy)
 
@@ -209,6 +214,8 @@ class SubtitleRenderer:
         (e.g. output piped to a file or another process).
         Mirrors the information shown in the ANSI display.
         """
+        # Fallback shows live captions first, then recent finalized
+        # sentences below to match the TTY layout used above.
         if self._live_hindi_tokens:
             stable = self._live_stable_count if self._live_stable_count is not None else len(self._live_hindi_tokens)
             stable_part = " ".join(self._live_hindi_tokens[:stable])
@@ -219,9 +226,10 @@ class SubtitleRenderer:
             if interim_part:
                 print(f"       {interim_part} (interim)")
 
-        elif self._history:
-            h, t = self._history[-1]
-            print(f"[FINAL] {h}  →  {t}")
+        # Print most recent finalized entries after live output
+        if self._history:
+            for h, t in self._history[-self._MAX_HISTORY :]:
+                print(f"[FINAL] {h}  →  {t}")
 
 
     # =====================================================
@@ -264,8 +272,41 @@ class SubtitleRenderer:
             translated : corrected/reconstructed English
                          sentence shown in the display
         """
+        def _tokens(text):
+            return [t for t in text.strip().split() if t]
+
+        def _overlap_ratio(a, b):
+            sa = set(a)
+            sb = set(b)
+            if not sa and not sb:
+                return 0.0
+            inter = sa.intersection(sb)
+            return len(inter) / max(len(sa), len(sb))
+
         if hindi.strip():
-            self._history.append((hindi, translated))
+            # If the new finalized sentence is a close correction of the
+            # most recent history entry, replace that entry instead of
+            # appending. This keeps the display from accumulating many
+            # near-duplicate lines when Whisper increments a hypothesis
+            # rapidly (e.g. "मैं पर" → "मैं पर्दा" → "मैं पर्दा उठा").
+            if self._history:
+                prev_h, prev_t = self._history[-1]
+
+                prev_tokens = _tokens(prev_h)
+                new_tokens = _tokens(hindi)
+
+                # Replace when there's a strong token overlap or when one
+                # string is a prefix of the other.
+                ratio = _overlap_ratio(prev_tokens, new_tokens)
+                is_prefix = (hindi.startswith(prev_h) or prev_h.startswith(hindi))
+
+                if is_prefix or ratio >= 0.6:
+                    # Replace newest history entry
+                    self._history[-1] = (hindi, translated)
+                else:
+                    self._history.append((hindi, translated))
+            else:
+                self._history.append((hindi, translated))
 
             if len(self._history) > self._MAX_HISTORY:
                 self._history.pop(0)

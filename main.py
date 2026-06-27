@@ -13,8 +13,10 @@ from stt_engine import transcribe_audio
 from word_parser import (
     extract_words,
     is_filler,
-    diff_new_words          # replaces the old single last_word check
+    # diff_new_words replaced by HypothesisManager
 )
+
+from hypothesis_manager import HypothesisManager
 
 from translator_engine import translate_word
 
@@ -111,56 +113,27 @@ def speech_recognition_worker():
       doesn't silently kill the thread
     """
 
-    rolling_buffer = np.zeros(0, dtype=np.int16)
-
     while not _shutdown.is_set():
 
-        # -------------------------------------------------
-        # BLOCKING PULL — no CPU burn while mic is silent
-        # -------------------------------------------------
-
+        # BLOCKING PULL — audio_listener now provides fixed-size windows
         try:
-            audio_chunk = audio_queue.get(timeout=0.05)
+            window = audio_queue.get(timeout=0.05)
         except queue.Empty:
             continue
 
         try:
-            rolling_buffer = np.concatenate(
-                [rolling_buffer, audio_chunk]
-            )
-
-            if rolling_buffer.size < ROLLING_WINDOW_SAMPLES:
-                continue
-
-            window = rolling_buffer[-ROLLING_WINDOW_SAMPLES:]
-
-            # ---------------------------------
             # DETECT SPEECH
-            # ---------------------------------
-
             speech_active = detect_speech(window)
 
-            # Always trim buffer — V1 skipped this on no-speech,
-            # letting the buffer grow without bound
             if not speech_active:
-                rolling_buffer = window[-OVERLAP_SAMPLES:]
                 continue
 
-            # ---------------------------------
             # SPEECH TO TEXT
-            # ---------------------------------
-
             hindi_text = transcribe_audio(window)
 
-            # transcribe_audio() returns a dict with keys
-            # {"text", "confidence", "is_final"} on success.
-            # Push only the text string into the processing queue
-            # so downstream code that expects a string works.
             if hindi_text:
                 text_queue.put(hindi_text["text"])
                 silence_manager.update_activity()
-
-            rolling_buffer = window[-OVERLAP_SAMPLES:]
 
         except Exception as e:
             print(f"[STT] Error in recognition cycle: {e}", file=sys.stderr)
@@ -193,8 +166,8 @@ def word_processing_worker():
       the whole pipeline
     """
 
-    # Tracks the previous Whisper hypothesis for diffing
-    prev_words = []
+    # Hypothesis manager handles incremental diffs from Whisper
+    manager = HypothesisManager()
 
     # Running sentence state fed to the renderer on every new token
     live_hindi_words = []
@@ -224,29 +197,29 @@ def word_processing_worker():
                 # single-word memory with a proper hypothesis diff.
                 # -----------------------------------------------
 
-                remove_count, replacement_words = diff_new_words(
-                    prev_words, all_words
+                remove_count, replacement_words = manager.update_and_diff(
+                    all_words
                 )
-                prev_words = all_words
 
-                # Build replacement token dicts and atomically replace
-                # the previous non-overlapping suffix in the token buffer.
+                # Build preview Hindi hypothesis and render it BEFORE translating.
                 start_index = len(token_buffer) - remove_count if remove_count else len(token_buffer)
 
+                # Renderer step: show Hindi hypothesis immediately.
+                live_hindi_words = (
+                    live_hindi_words[:start_index]
+                    + replacement_words
+                )
+                # Note: live_english_words remains the previous state until
+                # translations are available.
+                update_live(live_hindi_words, live_english_words, stable_count=start_index)
+
+                # TRANSLATOR STEP: translate replacement words and apply
+                # them to the token buffer once translations complete.
                 replacement_tokens = []
                 for word in replacement_words:
-
-                    # ---------------------------------
-                    # FILLER DETECTION
-                    # ---------------------------------
-
                     if is_filler(word):
                         filler_detected = True
                         break
-
-                    # ---------------------------------
-                    # TRANSLATE SINGLE TOKEN
-                    # ---------------------------------
 
                     english_word = translate_word(word)
 
@@ -256,10 +229,9 @@ def word_processing_worker():
                     })
 
                 if replacement_tokens or remove_count:
-                    # Apply replacement in the token buffer
                     token_buffer.replace_tokens(start_index, replacement_tokens)
 
-                    # Update live lists to reflect the buffer state
+                    # Update live lists to reflect the buffer state (now with translations)
                     live_hindi_words = (
                         live_hindi_words[:start_index]
                         + [t["hindi"] for t in replacement_tokens]
@@ -269,7 +241,7 @@ def word_processing_worker():
                         + [t["english"] for t in replacement_tokens]
                     )
 
-                    # Reflect the change immediately (provide stable_count)
+                    # Reflect the translated result immediately
                     update_live(live_hindi_words, live_english_words, stable_count=start_index)
 
             except Exception as e:
@@ -289,7 +261,7 @@ def word_processing_worker():
 
         if (
             filler_detected
-            or silence_manager.should_finalize(len(semantic_tokens))
+            or silence_manager.should_finalize(semantic_tokens)
         ):
 
             if semantic_tokens:
@@ -333,7 +305,7 @@ def word_processing_worker():
                 # ---------------------------------
 
                 token_buffer.clear()
-                prev_words = []
+                manager.prev_words = []
                 live_hindi_words = []
                 live_english_words = []
 

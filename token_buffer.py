@@ -37,7 +37,8 @@ class TokenBuffer:
     # GET TOKENS
     # -----------------------------
     def get_tokens(self):
-        return self.tokens
+        # Return a shallow copy to prevent external mutation
+        return list(self.tokens)
 
     # -----------------------------
     # TOKEN COUNT
@@ -78,3 +79,66 @@ class TokenBuffer:
         # Enforce sliding window of newest MAX_TOKENS tokens
         if len(self.tokens) > self.MAX_TOKENS:
             self.tokens = self.tokens[-self.MAX_TOKENS:]
+
+    # -----------------------------
+    # INSERT TOKENS (no replacement)
+    # -----------------------------
+    def insert_tokens(self, start_index, new_tokens):
+        """
+        Insert `new_tokens` at `start_index` without removing existing tokens.
+        """
+        if start_index < 0:
+            start_index = 0
+
+        if start_index > len(self.tokens):
+            start_index = len(self.tokens)
+
+        self.tokens = self.tokens[:start_index] + list(new_tokens) + self.tokens[start_index:]
+
+        if len(self.tokens) > self.MAX_TOKENS:
+            self.tokens = self.tokens[-self.MAX_TOKENS:]
+
+    # -----------------------------
+    # APPEND TOKENS
+    # -----------------------------
+    def append_tokens(self, new_tokens):
+        """Append a list of token dicts to the buffer."""
+        self.tokens.extend(list(new_tokens))
+
+        if len(self.tokens) > self.MAX_TOKENS:
+            self.tokens = self.tokens[-self.MAX_TOKENS:]
+
+    # -----------------------------
+    # UPDATE SINGLE TOKEN
+    # -----------------------------
+    def update_token(self, index, hindi=None, english=None):
+        """Update fields of the token at `index`. Raises IndexError if out of range."""
+        if index < 0:
+            index = 0
+        if index >= len(self.tokens):
+            raise IndexError("token index out of range")
+
+        token = self.tokens[index]
+        if hindi is not None:
+            token["hindi"] = hindi
+        if english is not None:
+            token["english"] = english
+
+    # -----------------------------
+    # DELETE RANGE
+    # -----------------------------
+    def delete_range(self, start_index, count=1):
+        """Delete `count` tokens starting at `start_index`."""
+        if count <= 0:
+            return
+
+        if start_index < 0:
+            start_index = 0
+
+        end_index = start_index + count
+        # Clamp bounds
+        start_index = min(start_index, len(self.tokens))
+        end_index = min(end_index, len(self.tokens))
+
+        if start_index < end_index:
+            del self.tokens[start_index:end_index]

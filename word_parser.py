@@ -1,4 +1,5 @@
 import re
+import warnings
 
 
 # -----------------------------
@@ -115,6 +116,11 @@ def diff_new_words(prev_words, new_words):
     is returned (conservative: better to duplicate
     one word than to drop real new content).
     """
+    warnings.warn(
+        "diff_new_words() is deprecated — use HypothesisManager in hypothesis_manager.py",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     if not prev_words:
         # No previous hypothesis — nothing to remove, all words are new
         return 0, new_words
