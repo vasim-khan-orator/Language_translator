@@ -10,73 +10,26 @@ from audio_listener import start_audio_stream
 from vad_engine import detect_speech
 from stt_engine import transcribe_audio
 
-from word_parser import (
-    extract_words,
-    is_filler,
-    # diff_new_words replaced by HypothesisManager
-)
-
-from hypothesis_manager import HypothesisManager
-
-from translator_engine import translate_word
-
-from token_buffer import TokenBuffer
-
+from word_parser import extract_words, is_filler
+from translator_engine import translate_phrase
 from silence_manager import SilenceManager
-
 from correction_engine import reconstruct_sentence
-
-from output_renderer import (
-    update_live,            # replaces display_output(mode="LIVE", ...)
-    finalize                # replaces the raw print() block
-)
+from output_renderer import update_live, finalize
 
 
 # =====================================================
-# GLOBAL QUEUES
+# GLOBAL QUEUES & FLAGS
 # =====================================================
 
-audio_queue = queue.Queue()
-
+# Increased queue size to store 10 seconds of 20ms audio chunks (500 chunks)
+audio_queue = queue.Queue(maxsize=500)
 text_queue = queue.Queue()
 
-
-# =====================================================
-# GRACEFUL SHUTDOWN FLAG
-# =====================================================
-
 _shutdown = threading.Event()
-
-
-# =====================================================
-# TOKEN BUFFER
-# =====================================================
-
-token_buffer = TokenBuffer()
-
-
-# =====================================================
-# SILENCE MANAGER
-# =====================================================
+_flush_audio = threading.Event()
 
 silence_manager = SilenceManager(
-    silence_threshold=2.0   # raised from 1.0 — stops single-word flushes
-)
-
-
-# =====================================================
-# STREAMING WINDOW SETTINGS
-# =====================================================
-
-SAMPLE_RATE = 16000
-ROLLING_WINDOW_SEC = 3.0
-OVERLAP_SEC = 1.0
-
-ROLLING_WINDOW_SAMPLES = int(
-    SAMPLE_RATE * ROLLING_WINDOW_SEC
-)
-OVERLAP_SAMPLES = int(
-    SAMPLE_RATE * OVERLAP_SEC
+    silence_threshold=1.5   # 1.5s pause marks the end of a spoken sentence
 )
 
 
@@ -86,58 +39,91 @@ OVERLAP_SAMPLES = int(
 
 def audio_capture_worker():
     """
-    Continuously captures microphone audio
-    and pushes chunks into audio queue.
-    Signals shutdown on fatal mic error.
+    Continuously captures raw 20ms microphone audio chunks
+    and pushes them into audio_queue.
     """
     try:
-        start_audio_stream(audio_queue)
+        start_audio_stream(audio_queue, shutdown_event=_shutdown, flush_event=_flush_audio)
     except Exception as e:
         print(f"\n[Audio] Fatal error: {e}", file=sys.stderr)
         _shutdown.set()
 
 
 # =====================================================
-# SPEECH RECOGNITION THREAD
+# SPEECH RECOGNITION (VAD ACCUMULATOR) THREAD
 # =====================================================
 
 def speech_recognition_worker():
     """
-    Audio -> Hindi text
-
-    Changes from V1:
-    - Blocking queue.get(timeout) replaces busy-wait polling
-    - Buffer is always trimmed (even on no-speech) to prevent
-      unbounded growth
-    - try/except around every inference call so a model error
-      doesn't silently kill the thread
+    State machine: IDLE -> ACCUMULATING -> FINALIZE.
+    Accumulates raw audio chunks while speaking and runs Whisper
+    on the complete accumulated audio, eliminating rolling-window clipping.
     """
+    state = "IDLE"
+    accumulated_chunks = []
+    idle_window = []  # rolling 300ms window (15 chunks of 20ms) to detect speech start
+    last_live_transcription_time = 0
+    last_speech_time = time.time()
 
     while not _shutdown.is_set():
-
-        # BLOCKING PULL — audio_listener now provides fixed-size windows
         try:
-            window = audio_queue.get(timeout=0.05)
+            chunk = audio_queue.get(timeout=0.05)
+            got_chunk = True
         except queue.Empty:
+            got_chunk = False
+
+        now = time.time()
+
+        if state == "IDLE":
+            if got_chunk:
+                idle_window.append(chunk)
+                if len(idle_window) > 15:  # keep last 300ms
+                    idle_window.pop(0)
+
+                if len(idle_window) == 15:
+                    window_audio = np.concatenate(idle_window)
+                    if detect_speech(window_audio):
+                        state = "ACCUMULATING"
+                        accumulated_chunks = list(idle_window)
+                        last_speech_time = now
+                        last_live_transcription_time = now
+                        silence_manager.reset()
+                        idle_window.clear()
             continue
 
-        try:
-            # DETECT SPEECH
-            speech_active = detect_speech(window)
+        elif state == "ACCUMULATING":
+            if got_chunk:
+                accumulated_chunks.append(chunk)
 
-            if not speech_active:
-                continue
+                # Check last 300ms for speech activity to keep silence timer updated
+                if len(accumulated_chunks) >= 15:
+                    recent_audio = np.concatenate(accumulated_chunks[-15:])
+                    if detect_speech(recent_audio):
+                        last_speech_time = now
+                        silence_manager.update_activity()
 
-            # SPEECH TO TEXT
-            hindi_text = transcribe_audio(window)
+            # Live preview update every ~750ms while speaking
+            if now - last_live_transcription_time >= 0.75 and len(accumulated_chunks) >= 25:
+                full_audio = np.concatenate(accumulated_chunks)
+                res = transcribe_audio(full_audio)
+                if res and res.get("text"):
+                    text_queue.put({"text": res["text"], "is_final": False})
+                last_live_transcription_time = now
 
-            if hindi_text:
-                text_queue.put(hindi_text["text"])
-                silence_manager.update_activity()
+            # Check if silence threshold reached or hard timeout triggered
+            silence_duration = now - last_speech_time
+            if silence_duration >= silence_manager.silence_threshold or silence_manager.is_hard_timeout():
+                # FINALIZE UTTERANCE
+                if accumulated_chunks:
+                    full_audio = np.concatenate(accumulated_chunks)
+                    res = transcribe_audio(full_audio)
+                    if res and res.get("text"):
+                        text_queue.put({"text": res["text"], "is_final": True})
 
-        except Exception as e:
-            print(f"[STT] Error in recognition cycle: {e}", file=sys.stderr)
-            continue
+                accumulated_chunks.clear()
+                idle_window.clear()
+                state = "IDLE"
+                silence_manager.reset()
 
 
 # =====================================================
@@ -146,174 +132,45 @@ def speech_recognition_worker():
 
 def word_processing_worker():
     """
-    Hindi text
-    -> diff new words (replaces single last_word check)
-    -> filler detection
-    -> translate
-    -> token buffer
-    -> live subtitle update (full accumulated lists)
-    -> silence / filler triggered finalization
-
-    Changes from V1:
-    - Blocking queue.get(timeout) replaces busy-wait polling
-    - diff_new_words() replaces `if word == last_word: continue`
-    - Accumulated word lists passed to update_live() on every token
-      so the renderer always has full sentence context
-    - Finalization uses should_finalize(token_count) which enforces
-      the 2 s silence threshold AND the min 3-token guard together
-    - finalize() replaces the raw print() block
-    - try/except around every stage so one bad token doesn't crash
-      the whole pipeline
+    Receives complete sentence transcriptions (live or final),
+    translates them at the phrase level, and renders subtitles.
     """
-
-    # Hypothesis manager handles incremental diffs from Whisper
-    manager = HypothesisManager()
-
-    # Running sentence state fed to the renderer on every new token
-    live_hindi_words = []
-    live_english_words = []
-
     while not _shutdown.is_set():
-
-        filler_detected = False
-
-        # -------------------------------------------------------
-        # PULL NEXT TRANSCRIPTION — non-blocking with timeout
-        # The `else` block only runs when we actually got an item
-        # -------------------------------------------------------
+        try:
+            item = text_queue.get(timeout=0.05)
+        except queue.Empty:
+            continue
 
         try:
-            hindi_text = text_queue.get(timeout=0.05)
-        except queue.Empty:
-            pass    # no new text this cycle — still check finalization
-        else:
-            try:
-                all_words = extract_words(hindi_text)
+            hindi_text = item["text"].strip()
+            is_final = item["is_final"]
 
-                # -----------------------------------------------
-                # INCREMENTAL DIFF — only process genuinely new
-                # words vs the previous overlapping window.
-                # This replaces the V1 `if word == last_word`
-                # single-word memory with a proper hypothesis diff.
-                # -----------------------------------------------
+            if not hindi_text:
+                continue
 
-                remove_count, replacement_words = manager.update_and_diff(
-                    all_words
-                )
-
-                # Build preview Hindi hypothesis and render it BEFORE translating.
-                start_index = len(token_buffer) - remove_count if remove_count else len(token_buffer)
-
-                # Renderer step: show Hindi hypothesis immediately.
-                live_hindi_words = (
-                    live_hindi_words[:start_index]
-                    + replacement_words
-                )
-                # Note: live_english_words remains the previous state until
-                # translations are available.
-                update_live(live_hindi_words, live_english_words, stable_count=start_index)
-
-                # TRANSLATOR STEP: translate replacement words and apply
-                # them to the token buffer once translations complete.
-                replacement_tokens = []
-                for word in replacement_words:
-                    if is_filler(word):
-                        filler_detected = True
+            if not is_final:
+                # Live accumulating preview (phrase translation)
+                english_trans = translate_phrase(hindi_text)
+                update_live(hindi_text, english_trans if english_trans else hindi_text)
+            else:
+                # Final completed sentence
+                final_english = reconstruct_sentence(hindi_text)
+                finalize(hindi_text, final_english, final_english)
+                
+                # Drain remaining outdated live previews in queue and trigger audio buffer clean
+                while not text_queue.empty():
+                    try:
+                        text_queue.get_nowait()
+                    except queue.Empty:
                         break
+                _flush_audio.set()
 
-                    english_word = translate_word(word)
-
-                    replacement_tokens.append({
-                        "hindi": word,
-                        "english": english_word,
-                    })
-
-                if replacement_tokens or remove_count:
-                    token_buffer.replace_tokens(start_index, replacement_tokens)
-
-                    # Update live lists to reflect the buffer state (now with translations)
-                    live_hindi_words = (
-                        live_hindi_words[:start_index]
-                        + [t["hindi"] for t in replacement_tokens]
-                    )
-                    live_english_words = (
-                        live_english_words[:start_index]
-                        + [t["english"] for t in replacement_tokens]
-                    )
-
-                    # Reflect the translated result immediately
-                    update_live(live_hindi_words, live_english_words, stable_count=start_index)
-
-            except Exception as e:
-                print(f"[Processing] Word error: {e}", file=sys.stderr)
-
-        # =================================================
-        # FINALIZATION LOGIC
-        #
-        # should_finalize() handles all three conditions:
-        #   1. silence_duration >= 2.0 s
-        #   2. token_count >= min_tokens (3)   ← guards against
-        #      single-word flushes even if silence is detected
-        #   3. hard_timeout (45 s) for continuous speech
-        # =================================================
-
-        semantic_tokens = token_buffer.get_tokens()
-
-        if (
-            filler_detected
-            or silence_manager.should_finalize(semantic_tokens)
-        ):
-
-            if semantic_tokens:
-
-                # ---------------------------------
-                # RECONSTRUCT FINAL SENTENCE
-                # ---------------------------------
-
-                try:
-                    final_sentence = reconstruct_sentence(
-                        semantic_tokens
-                    )
-                except Exception as e:
-                    # Correction engine failure — fall back to raw join
-                    final_sentence = " ".join(
-                        t["english"] for t in semantic_tokens
-                    )
-                    print(
-                        f"[Correction] Error, using raw join: {e}",
-                        file=sys.stderr
-                    )
-
-                raw_hindi = " ".join(
-                    t["hindi"] for t in semantic_tokens
-                )
-                raw_english = " ".join(
-                    t["english"] for t in semantic_tokens
-                )
-
-                # ---------------------------------
-                # FINAL SUBTITLE OUTPUT
-                # Replaces the raw print() block —
-                # renderer moves sentence to history
-                # and rolls the display
-                # ---------------------------------
-
-                finalize(raw_hindi, raw_english, final_sentence)
-
-                # ---------------------------------
-                # RESET ALL STATE
-                # ---------------------------------
-
-                token_buffer.clear()
-                manager.prev_words = []
-                live_hindi_words = []
-                live_english_words = []
-
-            silence_manager.reset()
+        except Exception as e:
+            print(f"[Processing] Error: {e}", file=sys.stderr)
 
 
 # =====================================================
-# SIGNAL HANDLER — clean Ctrl-C / SIGTERM exit
+# SIGNAL HANDLER
 # =====================================================
 
 def _handle_exit(sig, frame):
@@ -323,59 +180,28 @@ def _handle_exit(sig, frame):
 
 
 # =====================================================
-# MAIN
+# MAIN ENTRY POINT
 # =====================================================
 
 def main():
-
     signal.signal(signal.SIGINT, _handle_exit)
     signal.signal(signal.SIGTERM, _handle_exit)
 
     print("\n====================================")
-    print("Realtime Hindi Translator V1")
+    print("Realtime Hindi Translator V2 (VAD Accumulator)")
     print("====================================\n")
 
-    # ---------------------------------
-    # THREADS
-    # ---------------------------------
-
-    audio_thread = threading.Thread(
-        target=audio_capture_worker,
-        daemon=True
-    )
-
-    stt_thread = threading.Thread(
-        target=speech_recognition_worker,
-        daemon=True
-    )
-
-    processing_thread = threading.Thread(
-        target=word_processing_worker,
-        daemon=True
-    )
-
-    # ---------------------------------
-    # START THREADS
-    # ---------------------------------
+    audio_thread = threading.Thread(target=audio_capture_worker, daemon=True)
+    stt_thread = threading.Thread(target=speech_recognition_worker, daemon=True)
+    processing_thread = threading.Thread(target=word_processing_worker, daemon=True)
 
     audio_thread.start()
     stt_thread.start()
     processing_thread.start()
 
-    # ---------------------------------
-    # KEEP ALIVE UNTIL SHUTDOWN EVENT
-    # Replaced infinite time.sleep(1) with
-    # a flag-aware loop so SIGTERM/SIGINT
-    # can break cleanly without blocking
-    # ---------------------------------
-
     while not _shutdown.is_set():
         time.sleep(0.5)
 
-
-# =====================================================
-# ENTRY POINT
-# =====================================================
 
 if __name__ == "__main__":
     main()

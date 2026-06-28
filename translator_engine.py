@@ -5,6 +5,7 @@ import threading
 import collections
 from typing import Optional, Callable
 import time
+import sys
 
 
 # =====================================================
@@ -13,15 +14,26 @@ import time
 
 MODEL_NAME = "ai4bharat/indictrans2-indic-en-dist-200M"
 
-tokenizer = AutoTokenizer.from_pretrained(
-    MODEL_NAME,
-    trust_remote_code=True
-)
+import torch
+_device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"[Translator] Initializing IndicTrans2 (200M) on device: {_device.upper()}...")
 
-model = AutoModelForSeq2SeqLM.from_pretrained(
-    MODEL_NAME,
-    trust_remote_code=True
-)
+try:
+    tokenizer = AutoTokenizer.from_pretrained(
+        MODEL_NAME,
+        trust_remote_code=True
+    )
+
+    model = AutoModelForSeq2SeqLM.from_pretrained(
+        MODEL_NAME,
+        trust_remote_code=True
+    ).to(_device)
+except Exception as e:
+    print(f"[Translator] Failed to load IndicTrans2 model: {e}", file=sys.stderr)
+    print("[Translator] Check internet connection or HuggingFace cache.", file=sys.stderr)
+    sys.exit(1)
+
+_model_lock = threading.Lock()
 
 
 # =====================================================
@@ -48,8 +60,7 @@ _PREFIX = "hin_Deva eng_Latn"
 # CACHES
 # =====================================================
 
-# word-level cache: { "word": "translation" }
-_word_cache = {}
+# Caches are instantiated below after LRUCache definition.
 
 
 # Simple thread-safe LRU cache for phrase translations.
@@ -85,6 +96,7 @@ class LRUCache:
 
 # phrase-level cache using LRU
 _phrase_cache = LRUCache(maxsize=512)
+
 
 
 # =====================================================
@@ -146,14 +158,18 @@ def _phrase_worker():
                 padding=True,
                 truncation=True,
                 max_length=256,
-            )
+            ).to(_device)
 
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=_MAX_NEW_TOKENS,
-                num_beams=4,
-                early_stopping=True,
-            )
+            with _model_lock:
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=_MAX_NEW_TOKENS,
+                    num_beams=4,
+                    early_stopping="never",
+                    use_cache=False,
+                    repetition_penalty=1.2,
+                    no_repeat_ngram_size=3,
+                )
 
             translated = tokenizer.batch_decode(
                 outputs,
@@ -226,14 +242,18 @@ def translate_phrase(hindi_sentence):
             padding=True,
             truncation=True,        # prevent tokenizer error on very long sentences
             max_length=256,         # IndicTrans2 context window
-        )
+        ).to(_device)
 
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=_MAX_NEW_TOKENS,    # Fix: was unset → 20-token silent cap
-            num_beams=4,                        # beam search: better quality than greedy
-            early_stopping=True,
-        )
+        with _model_lock:
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=_MAX_NEW_TOKENS,    # Fix: was unset → 20-token silent cap
+                num_beams=4,                        # beam search: better quality than greedy
+                early_stopping="never",
+                use_cache=False,
+                repetition_penalty=1.2,
+                no_repeat_ngram_size=3,
+            )
 
         translated = tokenizer.batch_decode(
             outputs,
@@ -248,69 +268,3 @@ def translate_phrase(hindi_sentence):
 
     except Exception:
         return None
-
-
-# =====================================================
-# TRANSLATE WORD  ← live display path
-# =====================================================
-
-def translate_word(word):
-    """
-    Translate a single Hindi word to English.
-
-    Used only for the live accumulating subtitle display
-    so the user sees word-by-word English approximations
-    as they speak. The final output always uses
-    translate_phrase() via reconstruct_sentence() —
-    translate_word() output is never shown as a
-    finished translation.
-
-    Because word-level translation is inherently
-    context-free, its results are intentionally kept
-    separate from the phrase cache to prevent a
-    wrong word-level translation being reused as
-    a sentence-level output.
-
-    Args:
-        word : single Hindi word string (Devanagari)
-
-    Returns:
-        Best-effort English word string.
-        Falls back to the original word on error.
-    """
-
-    if not word or not word.strip():
-        return word
-
-    key = word.strip()
-
-    if key in _word_cache:
-        return _word_cache[key]
-
-    formatted = f"{_PREFIX} {key}"
-
-    try:
-        inputs = tokenizer(
-            formatted,
-            return_tensors="pt",
-            padding=True,
-        )
-
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=_MAX_NEW_TOKENS,    # Fix: was unset → 20-token silent cap
-        )
-
-        translated = tokenizer.batch_decode(
-            outputs,
-            skip_special_tokens=True
-        )[0].strip()
-
-        _word_cache[key] = translated
-
-        return translated if translated else key
-
-    except Exception:
-        # Never crash the live display thread on a
-        # translation error — return the raw Hindi word.
-        return key

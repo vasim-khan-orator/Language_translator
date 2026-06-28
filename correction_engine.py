@@ -1,4 +1,5 @@
 from translator_engine import translate_phrase
+from context_manager import update_current, finalize_current
 
 
 # =====================================================
@@ -26,42 +27,37 @@ from translator_engine import translate_phrase
 def reconstruct_sentence(tokens):
     """
     Translate the full buffered Hindi sentence at once.
-
-    Args:
-        tokens : list of dicts with keys "hindi" and "english"
-                 (the "english" key is ignored here — translation
-                  is now done on the joined Hindi string, not
-                  on the per-word English values)
-
-    Returns:
-        Grammatically correct English sentence string,
-        or empty string if tokens is empty.
+    Accepts raw Hindi string or list of tokens/strings.
     """
 
     if not tokens:
         return ""
 
-    # Join all buffered Hindi words into one sentence string.
-    # IndicTrans2 needs the complete sentence to produce
-    # correct word order — feeding it word-by-word is what
-    # caused the SOV salad in V1.
-    hindi_sentence = " ".join(
-        token["hindi"] for token in tokens
-    )
+    if isinstance(tokens, str):
+        hindi_sentence = tokens.strip()
+        fallback = hindi_sentence
+    else:
+        hindi_sentence = " ".join(
+            t["hindi"] if isinstance(t, dict) else str(t) for t in tokens
+        ).strip()
+        fallback = " ".join(
+            t.get("english", t.get("hindi", "")) if isinstance(t, dict) else str(t) for t in tokens
+        ).strip()
 
-    # Single phrase-level translation call.
-    # translate_phrase() handles the hin_Deva eng_Latn
-    # prefix and max_new_tokens — see translator_engine.py.
+    if not hindi_sentence:
+        return ""
+
+    update_current(hindi_sentence)
+
     translated = translate_phrase(hindi_sentence)
 
     if not translated:
-        # Fallback: raw English join (same as V1 output)
-        # so the display never goes blank on a model error.
-        fallback = " ".join(
-            token["english"] for token in tokens
-        )
-        return fallback.capitalize()
+        res = fallback.capitalize() if fallback else ""
+        finalize_current(res)
+        return res
 
     # Capitalize first letter as a safety step in case
     # the model returns a lowercase-first string.
-    return translated[0].upper() + translated[1:]
+    res = translated[0].upper() + translated[1:]
+    finalize_current(res)
+    return res
