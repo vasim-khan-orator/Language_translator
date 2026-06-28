@@ -1,5 +1,6 @@
 import sys
 import shutil
+import re
 
 
 # =====================================================
@@ -13,6 +14,8 @@ _YELLOW = "\033[93m"     # live English text
 _WHITE  = "\033[97m"     # finalized Hindi (history)
 _GREEN  = "\033[92m"     # finalized translated (history)
 _GRAY   = "\033[90m"     # separators, labels
+
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 
 
 # =====================================================
@@ -35,7 +38,7 @@ class SubtitleRenderer:
        [history 0 — older finalized sentence, dim ]
        [history 1 — recent finalized sentence     ]
       ──────────────────────────────────────────────
-       ▶  [accumulating Hindi text                ]
+       >  [accumulating Hindi text                ]
           [accumulating English text              ]
       ══════════════════════════════════════════════
 
@@ -76,13 +79,21 @@ class SubtitleRenderer:
     def _fit(self, text, max_len):
         """
         Truncate text with a trailing ellipsis if it
-        exceeds max_len characters. Prevents long
-        sentences from wrapping and breaking the fixed
-        line count assumption.
+        exceeds max_len visible characters, preserving ANSI codes.
         """
-        if len(text) <= max_len:
+        visible = _ANSI_RE.sub("", text)
+        if len(visible) <= max_len:
             return text
-        return text[:max_len - 1] + "…"
+        count = 0
+        i = 0
+        while i < len(text) and count < max_len - 1:
+            m = _ANSI_RE.match(text, i)
+            if m:
+                i = m.end()
+            else:
+                count += 1
+                i += 1
+        return text[:i] + "…" + _RESET
 
 
     # --------------------------------------------------
@@ -124,7 +135,7 @@ class SubtitleRenderer:
             hindi_line = " ".join(parts)
 
             lines.append(
-                f"  {_BOLD}▶  {self._fit(hindi_line, inner - 4)}{_RESET}"
+                f"  {_BOLD}>  {self._fit(hindi_line, inner - 4)}{_RESET}"
             )
         else:
             lines.append(
@@ -237,18 +248,10 @@ class SubtitleRenderer:
     # =====================================================
 
     def update_live(self, hindi_words, english_words, stable_count=None):
-        """
-        Call on every new token, passing the FULL
-        accumulated word lists (not just the new word).
-        The renderer replaces the live area entirely
-        each call — no appending needed from the caller.
-
-        Args:
-            hindi_words   : list of Hindi word strings
-                            accumulated since last reset
-            english_words : corresponding English
-                            translations (same length)
-        """
+        if isinstance(hindi_words, str):
+            hindi_words = [hindi_words] if hindi_words.strip() else []
+        if isinstance(english_words, str):
+            english_words = [english_words] if english_words.strip() else []
         self._live_hindi_tokens = list(hindi_words)
         self._live_english_tokens = list(english_words)
         self._live_stable_count = stable_count
@@ -372,6 +375,10 @@ def clear():
 # --------------------------------------------------
 def display_output(mode, hindi, english):
     if mode == "LIVE":
-        _renderer.update_live([hindi], [english], stable_count=None)
+        _renderer.update_live(
+            hindi if isinstance(hindi, list) else [hindi],
+            english if isinstance(english, list) else [english],
+            stable_count=None
+        )
     elif mode == "FINAL":
         _renderer.finalize(hindi, english, english)

@@ -1,16 +1,27 @@
 from faster_whisper import WhisperModel
 import numpy as np
 import re
+import sys
 
+
+import torch
 
 # -----------------------------
 # LOAD MODEL
 # -----------------------------
-model = WhisperModel(
-    "small",
-    device="cpu",
-    compute_type="int8"
-)
+try:
+    _device = "cuda" if torch.cuda.is_available() else "cpu"
+    _compute_type = "float16" if _device == "cuda" else "int8"
+    print(f"[STT] Initializing Whisper ('small') on device: {_device.upper()} ({_compute_type})...")
+    model = WhisperModel(
+        "small",
+        device=_device,
+        compute_type=_compute_type
+    )
+except Exception as e:
+    print(f"[STT] Failed to load Whisper model: {e}", file=sys.stderr)
+    print("[STT] Check internet connection or model cache.", file=sys.stderr)
+    sys.exit(1)
 
 
 # =====================================================
@@ -83,14 +94,15 @@ def transcribe_audio(audio_chunk):
         (hallucination — Hebrew, Latin, etc.)
     """
 
-    audio_float = (
-        audio_chunk.astype(np.float32) / 32768.0
-    )
+    if isinstance(audio_chunk, np.ndarray) and audio_chunk.dtype == np.int16:
+        audio_float = audio_chunk.astype(np.float32) / 32768.0
+    else:
+        audio_float = np.asarray(audio_chunk, dtype=np.float32)
 
     segments, info = model.transcribe(
         audio_float,
         language="hi",
-        beam_size=1,
+        beam_size=5,
 
         # Fix the UserWarning and prevent silent
         # truncation when sentence-level translation

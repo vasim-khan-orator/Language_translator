@@ -113,10 +113,8 @@ class TokenBuffer:
     # -----------------------------
     def update_token(self, index, hindi=None, english=None):
         """Update fields of the token at `index`. Raises IndexError if out of range."""
-        if index < 0:
-            index = 0
-        if index >= len(self.tokens):
-            raise IndexError("token index out of range")
+        if index < 0 or index >= len(self.tokens):
+            raise IndexError(f"token index {index} out of range (buffer size: {len(self.tokens)})")
 
         token = self.tokens[index]
         if hindi is not None:

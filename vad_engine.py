@@ -1,4 +1,6 @@
 import torch
+import numpy as np
+import sys
 from silero_vad import load_silero_vad
 from silero_vad import get_speech_timestamps
 
@@ -6,7 +8,12 @@ from silero_vad import get_speech_timestamps
 # -----------------------------
 # LOAD MODEL
 # -----------------------------
-model = load_silero_vad()
+try:
+    model = load_silero_vad()
+except Exception as e:
+    print(f"[VAD] Failed to load Silero VAD model: {e}", file=sys.stderr)
+    print("[VAD] Check internet connection or PyTorch installation.", file=sys.stderr)
+    sys.exit(1)
 
 
 # =====================================================
@@ -23,7 +30,7 @@ _SPEECH_THRESHOLD = 0.60
 # Real spoken words are rarely under 150–200 ms.
 # Filters clicks, coughs, and noise spikes that
 # Silero briefly marks as speech.
-_MIN_SPEECH_DURATION_MS = 200
+_MIN_SPEECH_DURATION_MS = 100
 
 # Don't split a speech region on silences shorter
 # than this. Prevents micro-pauses between syllables
@@ -33,11 +40,7 @@ _MIN_SILENCE_DURATION_MS = 300
 
 # Minimum fraction of the audio window that must
 # be speech before we pass it to STT.
-# A 3-second window with only 20 ms of "speech"
-# (0.7%) is almost certainly noise, not a real
-# utterance. Requiring at least 15% means at least
-# ~450 ms of actual speech in the window.
-_MIN_SPEECH_RATIO = 0.15
+_MIN_SPEECH_RATIO = 0.10
 
 
 # =====================================================
@@ -58,10 +61,10 @@ def detect_speech(audio_chunk):
          total duration — likely a false positive).
     """
 
-    audio_tensor = torch.tensor(
-        audio_chunk,
-        dtype=torch.float32
-    ) / 32768.0
+    if isinstance(audio_chunk, np.ndarray) and audio_chunk.dtype == np.int16:
+        audio_tensor = torch.tensor(audio_chunk, dtype=torch.float32) / 32768.0
+    else:
+        audio_tensor = torch.as_tensor(audio_chunk, dtype=torch.float32)
 
     speech_timestamps = get_speech_timestamps(
         audio_tensor,

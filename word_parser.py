@@ -1,5 +1,4 @@
 import re
-import warnings
 
 
 # -----------------------------
@@ -72,9 +71,6 @@ def extract_words(text):
         if not word:
             continue
 
-        if word in FILLERS:
-            continue
-
         cleaned_words.append(word)
 
     return cleaned_words
@@ -91,58 +87,3 @@ def is_filler(word):
     return clean_word(word) in FILLERS
 
 
-# -----------------------------
-# INCREMENTAL WORD DIFF
-# -----------------------------
-def diff_new_words(prev_words, new_words):
-    """
-    Given the previous Whisper hypothesis (prev_words)
-    and the new hypothesis (new_words) from the next
-    rolling window, return ONLY the words that are
-    genuinely new — i.e. not already seen in the
-    overlap region.
-
-    This prevents re-processing the same words that
-    appear in the overlapping audio between rolling
-    windows, which was the root cause of duplicate
-    token fragments in V1.
-
-    Example:
-        prev = ["मैं", "बाज़ार"]
-        new  = ["मैं", "बाज़ार", "गया", "था"]
-        → returns ["गया", "था"]
-
-    If no overlap is found, the full new_words list
-    is returned (conservative: better to duplicate
-    one word than to drop real new content).
-    """
-    warnings.warn(
-        "diff_new_words() is deprecated — use HypothesisManager in hypothesis_manager.py",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    if not prev_words:
-        # No previous hypothesis — nothing to remove, all words are new
-        return 0, new_words
-
-    if not new_words:
-        # No new hypothesis — remove entire previous suffix
-        return len(prev_words), []
-
-    # Find the longest suffix of prev_words that matches
-    # a prefix of new_words (the overlap). We'll remove the
-    # non-overlapping tail of prev_words and replace it with
-    # the non-overlapping tail of new_words.
-    max_check = min(len(prev_words), len(new_words))
-
-    overlap_len = 0
-
-    for i in range(max_check, 0, -1):
-        if prev_words[-i:] == new_words[:i]:
-            overlap_len = i
-            break
-
-    remove_count = len(prev_words) - overlap_len
-    replacement_words = new_words[overlap_len:]
-
-    return remove_count, replacement_words

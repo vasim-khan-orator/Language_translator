@@ -48,7 +48,7 @@ htmlcov/
 
 # Audio / output artifacts
 output/
- recordings/
+recordings/
 
 # Misc
 *.bak

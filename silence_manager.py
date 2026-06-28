@@ -199,8 +199,8 @@ class SilenceManager:
         if token_count < self.min_tokens:
             return False
 
-        # Primary trigger: grammatical sentence completion.
-        if tokens is not None and self.is_grammar_complete(tokens):
+        # Primary trigger: silence detected.
+        if self.is_silence_detected():
             return True
 
         # Secondary trigger: hard timeout as before.
