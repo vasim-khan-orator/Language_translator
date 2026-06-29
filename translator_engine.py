@@ -6,6 +6,7 @@ import collections
 from typing import Optional, Callable
 import time
 import sys
+import re
 
 
 # =====================================================
@@ -41,18 +42,11 @@ _model_lock = threading.Lock()
 # =====================================================
 
 # Max output tokens for all generation calls.
-# V1 left this unset, which silently capped output
-# at 20 tokens (the model-agnostic default) and
-# caused the UserWarning visible in every run.
 # 128 covers any realistic sentence length while
 # preventing runaway generation.
 _MAX_NEW_TOKENS = 128
 
 # IndicTrans2 tag prefix format.
-# All input strings must start with this pair —
-# it tells the model which script to translate
-# from (hin_Deva = Hindi Devanagari) and to
-# (eng_Latn = English Latin script).
 _PREFIX = "hin_Deva eng_Latn"
 
 
@@ -60,10 +54,6 @@ _PREFIX = "hin_Deva eng_Latn"
 # CACHES
 # =====================================================
 
-# Caches are instantiated below after LRUCache definition.
-
-
-# Simple thread-safe LRU cache for phrase translations.
 class LRUCache:
     def __init__(self, maxsize=200):
         self.maxsize = maxsize
@@ -74,7 +64,6 @@ class LRUCache:
         with self.lock:
             try:
                 val = self.data.pop(key)
-                # move to end (most-recent)
                 self.data[key] = val
                 return val
             except KeyError:
@@ -86,7 +75,6 @@ class LRUCache:
                 self.data.pop(key)
             self.data[key] = value
             if len(self.data) > self.maxsize:
-                # pop least-recently-used
                 self.data.popitem(last=False)
 
     def contains(self, key):
@@ -94,22 +82,18 @@ class LRUCache:
             return key in self.data
 
 
-# phrase-level cache using LRU
 _phrase_cache = LRUCache(maxsize=512)
-
 
 
 # =====================================================
 # ASYNC PHRASE QUEUE
 # =====================================================
 
-# Items are tuples: (hindi_sentence, optional callback)
 _phrase_queue = queue.Queue()
 
 
 def enqueue_phrase(hindi_sentence: str, callback: Optional[Callable[[Optional[str]], None]] = None):
-    """Enqueue a phrase for asynchronous translation. Callback is called
-    with the translation (or None on failure) once available."""
+    """Enqueue a phrase for asynchronous translation."""
     if not hindi_sentence or not hindi_sentence.strip():
         if callback:
             callback(None)
@@ -117,7 +101,6 @@ def enqueue_phrase(hindi_sentence: str, callback: Optional[Callable[[Optional[st
 
     key = hindi_sentence.strip()
 
-    # If already cached, call back immediately
     cached = _phrase_cache.get(key)
     if cached is not None:
         if callback:
@@ -141,7 +124,6 @@ def _phrase_worker():
             _phrase_queue.task_done()
             continue
 
-        # Double-check cache to avoid duplicated work
         cached = _phrase_cache.get(key)
         if cached is not None:
             if callback:
@@ -191,64 +173,70 @@ def _phrase_worker():
         _phrase_queue.task_done()
 
 
-# Start background worker thread
 _worker_thread = threading.Thread(target=_phrase_worker, daemon=True)
 _worker_thread.start()
 
 
 # =====================================================
-# TRANSLATE PHRASE  ← primary output-quality path
+# SENTENCE CHUNKING
+# =====================================================
+# IndicTrans2 200M has a 256 SentencePiece token context
+# window.  A single Hindi word averages ~3-5 subword
+# tokens, so ~12 Hindi words is a safe chunk size that
+# stays well within the limit with room for the prefix
+# tags and generation overhead.
+
+_CHUNK_WORD_LIMIT = 12
+
+
+def _split_into_chunks(text, limit=_CHUNK_WORD_LIMIT):
+    """
+    Split Hindi text into chunks of at most `limit` words.
+    Tries to split at natural punctuation boundaries first
+    (Devanagari danda). Falls back to word-limit splitting.
+    """
+    sentences = re.split(r'[।|?!.\n]+', text)
+    sentences = [s.strip() for s in sentences if s.strip()]
+
+    chunks = []
+    for sentence in sentences:
+        words = sentence.split()
+        if len(words) <= limit:
+            chunks.append(sentence)
+        else:
+            for i in range(0, len(words), limit):
+                chunk = " ".join(words[i:i + limit])
+                if chunk.strip():
+                    chunks.append(chunk.strip())
+
+    return chunks
+
+
+# =====================================================
+# TRANSLATE SINGLE CHUNK (internal)
 # =====================================================
 
-def translate_phrase(hindi_sentence):
+def _translate_single_chunk(hindi_text):
     """
-    Translate a complete Hindi sentence to English.
-
-    Called once at finalization time by
-    correction_engine.reconstruct_sentence() after
-    silence or a filler word ends the utterance.
-
-    Passing the FULL sentence gives IndicTrans2 the
-    grammatical context it needs to:
-      • Reorder SOV → SVO  (Hindi verb-final → English verb-medial)
-      • Correctly decode conjugated verb forms
-        (e.g. "dunga" = "will do" only makes sense with a subject)
-      • Insert articles and prepositions (to / the / a)
-        that Hindi does not use but English requires
-
-    Args:
-        hindi_sentence : str — joined Hindi words from token buffer,
-                         e.g. "मैं घर जाता हूँ"
-
-    Returns:
-        Translated English string, or None on error / empty input.
+    Translate a single chunk (guaranteed to be within
+    the 256-token context window) through IndicTrans2.
     """
-
-    if not hindi_sentence or not hindi_sentence.strip():
-        return None
-
-    key = hindi_sentence.strip()
-
-    cached = _phrase_cache.get(key)
-    if cached is not None:
-        return cached
-
-    formatted = f"{_PREFIX} {key}"
+    formatted = f"{_PREFIX} {hindi_text}"
 
     try:
         inputs = tokenizer(
             formatted,
             return_tensors="pt",
             padding=True,
-            truncation=True,        # prevent tokenizer error on very long sentences
-            max_length=256,         # IndicTrans2 context window
+            truncation=True,
+            max_length=256,
         ).to(_device)
 
         with _model_lock:
             outputs = model.generate(
                 **inputs,
-                max_new_tokens=_MAX_NEW_TOKENS,    # Fix: was unset → 20-token silent cap
-                num_beams=4,                        # beam search: better quality than greedy
+                max_new_tokens=_MAX_NEW_TOKENS,
+                num_beams=4,
                 early_stopping="never",
                 use_cache=False,
                 repetition_penalty=1.2,
@@ -260,11 +248,62 @@ def translate_phrase(hindi_sentence):
             skip_special_tokens=True
         )[0].strip()
 
-        if translated:
-            _phrase_cache.set(key, translated)
-            return translated
-
-        return None
+        return translated if translated else None
 
     except Exception:
         return None
+
+
+# =====================================================
+# TRANSLATE PHRASE  -- primary output-quality path
+# =====================================================
+
+def translate_phrase(hindi_sentence):
+    """
+    Translate a complete Hindi sentence to English.
+    For long input, automatically chunks into segments
+    that fit within IndicTrans2's 256-token context
+    window and joins the translated results.
+    """
+
+    if not hindi_sentence or not hindi_sentence.strip():
+        return None
+
+    key = hindi_sentence.strip()
+
+    cached = _phrase_cache.get(key)
+    if cached is not None:
+        return cached
+
+    words = key.split()
+
+    # Short sentence: translate directly (fast path)
+    if len(words) <= _CHUNK_WORD_LIMIT:
+        result = _translate_single_chunk(key)
+        if result:
+            _phrase_cache.set(key, result)
+        return result
+
+    # Long sentence: chunk, translate each, join
+    chunks = _split_into_chunks(key)
+    translated_parts = []
+
+    for chunk in chunks:
+        chunk_cached = _phrase_cache.get(chunk)
+        if chunk_cached is not None:
+            translated_parts.append(chunk_cached)
+            continue
+
+        result = _translate_single_chunk(chunk)
+        if result:
+            _phrase_cache.set(chunk, result)
+            translated_parts.append(result)
+        else:
+            translated_parts.append(chunk)
+
+    if translated_parts:
+        joined = " ".join(translated_parts)
+        _phrase_cache.set(key, joined)
+        return joined
+
+    return None

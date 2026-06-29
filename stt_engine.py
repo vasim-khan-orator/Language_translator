@@ -104,26 +104,24 @@ def transcribe_audio(audio_chunk):
         language="hi",
         beam_size=5,
 
-        # Fix the UserWarning and prevent silent
-        # truncation when sentence-level translation
-        # is introduced later.
         max_new_tokens=128,
 
-        # Do NOT feed the previous window's output
-        # back as a prompt. In a rolling-window setup
-        # this causes hallucination carryover where
-        # Whisper "continues" a sentence from the
-        # previous chunk even when the audio doesn't
-        # support it — exactly the behaviour that
-        # produced fragments like "गा या विजान" in V1.
         condition_on_previous_text=False,
 
-        # Standard faster-whisper quality gates,
-        # set explicitly so they are visible and
-        # tunable rather than silently defaulting.
         no_speech_threshold=_MAX_NO_SPEECH_PROB,
         log_prob_threshold=-1.0,
         compression_ratio_threshold=2.4,
+
+        # Anti-hallucination: penalize repeated tokens so
+        # Whisper doesn't get stuck in loops like
+        # "एक लिएक लिएक लिए..."
+        repetition_penalty=1.2,
+        no_repeat_ngram_size=3,
+
+        # Suppress hallucinated text during silence gaps
+        # within the audio. If a segment's audio is mostly
+        # silence but Whisper still generates text, skip it.
+        hallucination_silence_threshold=0.5,
     )
 
     # -------------------------------------------------
@@ -153,11 +151,16 @@ def transcribe_audio(audio_chunk):
     final_text = final_text.strip()
 
     # -------------------------------------------------
+    # REPETITION COLLAPSE
+    # -------------------------------------------------
+    # Catch any remaining Whisper loops that survived
+    # the generation-level repetition_penalty.
+    # e.g. "एक लिए एक लिए एक लिए" -> "एक लिए"
+    final_text = _collapse_repeats(final_text)
+
+    # -------------------------------------------------
     # SCRIPT VALIDATION
     # -------------------------------------------------
-    # Last line of defence: reject any output that
-    # doesn't look like Devanagari Hindi regardless
-    # of how it got through the earlier gates.
     if not _is_valid_hindi(final_text):
         return None
 
@@ -169,3 +172,43 @@ def transcribe_audio(audio_chunk):
         }
 
     return None
+
+
+def _collapse_repeats(text):
+    """
+    Detect and collapse repeated word sequences in text.
+    Checks for repeated n-grams (1 to 5 words) and
+    removes duplicate occurrences.
+    """
+    if not text:
+        return text
+
+    words = text.split()
+    if len(words) < 4:
+        return text
+
+    # Check for repeated n-grams of length 1 to 5
+    for n in range(1, 6):
+        if len(words) < n * 2:
+            continue
+
+        cleaned = []
+        i = 0
+        while i < len(words):
+            # Check if the next n words repeat the current n words
+            if i + n * 2 <= len(words):
+                current = words[i:i + n]
+                next_group = words[i + n:i + n * 2]
+                if current == next_group:
+                    # Found a repeat; keep current, skip duplicates
+                    cleaned.extend(current)
+                    i += n
+                    # Skip all consecutive repetitions
+                    while i + n <= len(words) and words[i:i + n] == current:
+                        i += n
+                    continue
+            cleaned.append(words[i])
+            i += 1
+        words = cleaned
+
+    return " ".join(words)

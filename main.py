@@ -29,8 +29,15 @@ _shutdown = threading.Event()
 _flush_audio = threading.Event()
 
 silence_manager = SilenceManager(
-    silence_threshold=1.5   # 1.5s pause marks the end of a spoken sentence
+    silence_threshold=1.5,  # 1.5s pause marks the end of a spoken sentence
+    hard_timeout=28.0,      # Must stay below Whisper's 30s mel spectrogram limit
 )
+
+# Whisper processes audio through a fixed 30-second mel spectrogram window.
+# Audio beyond 30s is silently truncated or produces hallucinations.
+# We cap accumulation at 29s to stay safely within that boundary.
+_MAX_AUDIO_SECONDS = 29.0
+_MAX_AUDIO_CHUNKS = int(_MAX_AUDIO_SECONDS / 0.02)  # 1450 chunks at 20ms each
 
 
 # =====================================================
@@ -110,9 +117,11 @@ def speech_recognition_worker():
                     text_queue.put({"text": res["text"], "is_final": False})
                 last_live_transcription_time = now
 
-            # Check if silence threshold reached or hard timeout triggered
+            # Check if silence threshold reached, hard timeout, or audio cap hit
             silence_duration = now - last_speech_time
-            if silence_duration >= silence_manager.silence_threshold or silence_manager.is_hard_timeout():
+            audio_cap_hit = len(accumulated_chunks) >= _MAX_AUDIO_CHUNKS
+
+            if silence_duration >= silence_manager.silence_threshold or silence_manager.is_hard_timeout() or audio_cap_hit:
                 # FINALIZE UTTERANCE
                 if accumulated_chunks:
                     full_audio = np.concatenate(accumulated_chunks)
@@ -134,6 +143,10 @@ def word_processing_worker():
     """
     Receives complete sentence transcriptions (live or final),
     translates them at the phrase level, and renders subtitles.
+
+    Finalization runs in a background thread so that live
+    preview rendering for the NEXT sentence is never blocked
+    by the previous sentence's heavy beam-search translation.
     """
     while not _shutdown.is_set():
         try:
@@ -153,11 +166,23 @@ def word_processing_worker():
                 english_trans = translate_phrase(hindi_text)
                 update_live(hindi_text, english_trans if english_trans else hindi_text)
             else:
-                # Final completed sentence
-                final_english = reconstruct_sentence(hindi_text)
-                finalize(hindi_text, final_english, final_english)
-                
-                # Drain remaining outdated live previews in queue and trigger audio buffer clean
+                # Show the Hindi text immediately as "translating..."
+                update_live(hindi_text, "Translating...")
+
+                # Run heavy translation in background so this
+                # thread can immediately process new live previews
+                _finalize_text = hindi_text
+                def _do_finalize(text=_finalize_text):
+                    try:
+                        final_english = reconstruct_sentence(text)
+                        finalize(text, final_english, final_english)
+                    except Exception as e:
+                        print(f"[Finalize] Error: {e}", file=sys.stderr)
+                        finalize(text, text, text)
+
+                threading.Thread(target=_do_finalize, daemon=True).start()
+
+                # Drain outdated live previews and flush audio
                 while not text_queue.empty():
                     try:
                         text_queue.get_nowait()
